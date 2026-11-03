@@ -5,11 +5,23 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
-from app.api.routers import auth, roles, users
+from app.api.routers import (
+    assets,
+    auth,
+    dashboard,
+    discovery,
+    forecasts,
+    profile,
+    recommendations,
+    roles,
+    users,
+)
 from app.core.config import Settings, get_settings
-from app.db.mongo import create_client, ensure_indexes, get_database
+from app.db.postgres import create_pool, ensure_schema
 from app.seed import seed_defaults
+from app.services.errors import ServiceError
 
 logging.basicConfig(level=logging.INFO)
 
@@ -19,14 +31,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        client = create_client(settings)
-        app.state.db = get_database(client, settings)
-        await ensure_indexes(app.state.db)
-        await seed_defaults(app.state.db, settings)
+        pool = await create_pool(settings)
         try:
+            await ensure_schema(pool)
+            await seed_defaults(pool, settings)
+            app.state.db = pool
             yield
         finally:
-            await client.close()
+            await pool.close()
 
     app = FastAPI(
         title=settings.app_name,
@@ -37,6 +49,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         openapi_url=None if settings.is_production else "/openapi.json",
     )
 
+    # Routes read settings through Depends(get_settings); make them see the same
+    # instance this app was built with (matters when create_app(custom_settings) is used, e.g. in tests).
+    app.dependency_overrides[get_settings] = lambda: settings
+
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origin_list,
@@ -45,18 +61,40 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         allow_headers=["*"],
     )
 
+    # Services raise domain errors (NotFound, Conflict, ...);
+    # render them as FastAPI-style JSON.
+    @app.exception_handler(ServiceError)
+    async def service_error_handler(
+        _: Request,
+        exc: ServiceError,
+    ) -> JSONResponse:
+        return JSONResponse(
+            {"detail": exc.detail},
+            status_code=exc.status_code,
+        )
+
     @app.get("/api/health", tags=["health"])
     async def health(request: Request) -> dict[str, str]:
         try:
-            await request.app.state.db.command("ping")
+            await request.app.state.db.fetchval("SELECT 1")
         except Exception:
-            raise HTTPException(503, detail="Database unavailable") from None
+            raise HTTPException(
+                503,
+                detail="Database unavailable",
+            ) from None
+
         return {"status": "ok"}
 
     # Register new modules here.
     app.include_router(auth.router)
     app.include_router(users.router)
     app.include_router(roles.router)
+    app.include_router(profile.router)
+    app.include_router(assets.router)
+    app.include_router(forecasts.router)
+    app.include_router(recommendations.router)
+    app.include_router(discovery.router)
+    app.include_router(dashboard.router)
 
     return app
 
@@ -67,4 +105,9 @@ if __name__ == "__main__":
     import uvicorn
 
     s = get_settings()
-    uvicorn.run("app.main:app", host=s.api_host, port=s.api_port, reload=not s.is_production)
+    uvicorn.run(
+        "app.main:app",
+        host=s.api_host,
+        port=s.api_port,
+        reload=not s.is_production,
+    )

@@ -50,3 +50,188 @@ export interface LoginResponse {
   expires_in: number;
   user: CurrentUser;
 }
+
+export interface RiskLevelOption {
+  key: string;
+  label: string;
+  description: string;
+}
+
+export interface InterestOption {
+  key: string;
+  label: string;
+  /** Recommendable assets behind this interest. */
+  asset_count: number;
+}
+
+export interface AssetTypeOption {
+  key: string;
+  label: string;
+}
+
+export interface ProfileOptions {
+  risk_levels: RiskLevelOption[];
+  interests: InterestOption[];
+  asset_types: AssetTypeOption[];
+  max_followed: number;
+}
+
+export interface Profile {
+  risk_level: string;
+  interests: string[];
+  asset_types: string;
+  followed_tickers: string[];
+  completed_at: string;
+  updated_at: string;
+}
+
+export interface AssetSummary {
+  ticker: string;
+  name: string;
+  asset_type: string;
+  sector: string;
+}
+
+// --- Discovery / research snapshots (backend/app/schemas/recommendations.py) ---------------
+
+export type Stance = "EXPLORE" | "MONITOR" | "CAUTION";
+
+export interface Forecast {
+  return_10d: number | null;
+  lower: number | null;
+  upper: number | null;
+  model_version: string | null;
+  basis: string;
+}
+
+export interface NewsSignal {
+  score: number | null;
+  relevance: number | null;
+  recency_hours: number | null;
+  source: string | null;
+  article_count: number;
+}
+
+/** Most recent stored provider news sentiment; display-only, never moves the stance. */
+export interface NewsSentiment {
+  score: number;
+  source: "marketaux" | "alpha_vantage";
+  as_of: string;
+  article_count: number;
+  lookback_days: number;
+}
+
+export interface FundamentalMetric {
+  value: number;
+  assessment: "strong" | "neutral" | "weak";
+}
+
+/** Point-in-time SEC XBRL fundamentals; score/rating are null when the check abstained. */
+export interface FundamentalsSignal {
+  score: number | null;
+  rating: "strong" | "neutral" | "weak" | null;
+  metrics: Record<string, FundamentalMetric>;
+  metric_count: number;
+  period_end: string | null;
+  filed: string | null;
+  age_days: number | null;
+  source: string | null;
+}
+
+export interface Signal {
+  baseline_stance: Stance;
+  news_aware_stance: Stance;
+  provisional: boolean;
+  decision_trace: string[];
+  news_signal: NewsSignal;
+  fundamentals_signal: FundamentalsSignal;
+  risk_profile: string;
+}
+
+export interface Citation {
+  title: string;
+  source_type: string;
+  published_at: string | null;
+  source_url: string | null;
+}
+
+export interface Evidence {
+  title: string;
+  source_type: string;
+  published_at: string | null;
+  source_url: string | null;
+  snippet: string;
+  /** Provider (Marketaux) per-article sentiment, -1..1, for news; null for filings. */
+  sentiment: number | null;
+}
+
+export interface Explanation {
+  text: string;
+  citations: Citation[];
+  abstained: boolean;
+  caveats: string[];
+}
+
+export interface RecommendationSnapshot {
+  ticker: string;
+  name: string;
+  sector: string;
+  asset_type: string;
+  as_of: string | null;
+  forecast: Forecast;
+  signal: Signal;
+  evidence: Evidence[];
+  explanation: Explanation;
+  /** Newest stored articles; only on the company detail response. */
+  recent_news?: Evidence[];
+  news_sentiment?: NewsSentiment | null;
+}
+
+export interface DiversificationNote {
+  sector_exposure: Record<string, number>;
+  dominant_sector: string | null;
+  concentrated: boolean;
+  warning: string | null;
+  diversifying_tickers: string[];
+}
+
+export interface DiscoveryResponse {
+  candidates: RecommendationSnapshot[];
+  diversification: DiversificationNote;
+}
+
+// --- Dashboard (backend/app/schemas/dashboard.py) ---------------
+
+/** One-year numbers; null when an asset has too little price history. */
+export interface AssetRisk {
+  volatility_1y: number | null;
+  beta: number | null;
+  max_drawdown_1y: number | null;
+  dividend_yield: number | null;
+}
+
+export interface DashboardAsset {
+  ticker: string;
+  name: string;
+  asset_type: string;
+  category: string | null;
+  sector: string;
+  risk: AssetRisk | null;
+}
+
+export interface DashboardSuggestion extends DashboardAsset {
+  /** 0-1 similarity to the profile, for ordering only; not a forecast. */
+  score: number;
+  /** Plain-English reasons: content reasons first, the last one is always about risk. */
+  reasons: string[];
+}
+
+export interface Dashboard {
+  risk_level: { key: string; label: string; volatility_limit: number; step: number | null; steps: number };
+  interests: { key: string; label: string }[];
+  asset_types: string;
+  /** Last trading day in the price data behind the risk numbers (YYYY-MM-DD). */
+  prices_as_of: string | null;
+  watchlist: DashboardAsset[];
+  suggestions: DashboardSuggestion[];
+}

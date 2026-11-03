@@ -3,35 +3,125 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+import asyncpg
 import jwt
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pymongo.asynchronous.database import AsyncDatabase
 
 from app.core.config import Settings, get_settings
 from app.core.permissions import ADMIN_ROLE, effective_permissions
 from app.core.security import decode_access_token
+from app.repositories.assets import AssetsRepository
+from app.repositories.forecasts import ForecastRepository
+from app.repositories.news import NewsRepository
+from app.repositories.profiles import ProfilesRepository
+from app.repositories.recommendations import RecommendationsRepository
 from app.repositories.roles import RolesRepository
 from app.repositories.users import UsersRepository
+from app.services.dashboard import DashboardService
+from app.services.forecasts import ForecastService
+from app.services.profiles import ProfileService
+from app.services.recommendations import RecommendationService
+from app.services.research import ResearchService
+from app.services.users import UserService
 
 bearer_scheme = HTTPBearer(auto_error=False)
 
 
-def get_db(request: Request) -> AsyncDatabase:
+def get_db(request: Request) -> asyncpg.Pool:
     return request.app.state.db
 
 
-def get_users_repo(db: AsyncDatabase = Depends(get_db)) -> UsersRepository:
+def get_users_repo(db: asyncpg.Pool = Depends(get_db)) -> UsersRepository:
     return UsersRepository(db)
 
 
-def get_roles_repo(db: AsyncDatabase = Depends(get_db)) -> RolesRepository:
+def get_roles_repo(db: asyncpg.Pool = Depends(get_db)) -> RolesRepository:
     return RolesRepository(db)
+
+
+def get_assets_repo(db: asyncpg.Pool = Depends(get_db)) -> AssetsRepository:
+    return AssetsRepository(db)
+
+
+def get_profiles_repo(db: asyncpg.Pool = Depends(get_db)) -> ProfilesRepository:
+    return ProfilesRepository(db)
+
+
+def get_recommendations_repo(db: asyncpg.Pool = Depends(get_db)) -> RecommendationsRepository:
+    return RecommendationsRepository(db)
+
+
+def get_research_service(
+    recs: RecommendationsRepository = Depends(get_recommendations_repo),
+    db: asyncpg.Pool = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> ResearchService:
+    return ResearchService(recs, NewsRepository(db, settings.shared_data_schema))
+
+
+def get_user_service(
+    users: UsersRepository = Depends(get_users_repo),
+    roles: RolesRepository = Depends(get_roles_repo),
+) -> UserService:
+    return UserService(users, roles)
+
+
+def get_profile_service(
+    profiles: ProfilesRepository = Depends(get_profiles_repo),
+    assets: AssetsRepository = Depends(get_assets_repo),
+) -> ProfileService:
+    return ProfileService(profiles, assets)
+
+
+def get_forecast_service(
+    request: Request,
+    settings: Settings = Depends(get_settings),
+):
+    if settings.forecast_model_dir is not None:
+        from app.repositories.forecast_feature_snapshot import SnapshotFeatureRepository
+        from app.services.forecast_inference import ForecastInferenceService
+
+        return ForecastInferenceService(
+            SnapshotFeatureRepository(settings.forecast_model_dir),
+            settings.forecast_model_dir,
+        )
+
+    if settings.forecast_results_dir is not None:
+        return ForecastService(ForecastRepository(settings.forecast_results_dir))
+
+    from app.repositories.database_forecasts import DatabaseForecastRepository
+    from app.services.database_forecasts import DatabaseForecastService
+
+    return DatabaseForecastService(DatabaseForecastRepository(request.app.state.db))
+
+
+def get_forecast_assessment_service(
+    profiles: ProfilesRepository = Depends(get_profiles_repo),
+    assets: AssetsRepository = Depends(get_assets_repo),
+):
+    from app.services.forecast_assessment import ForecastAssessmentService
+
+    return ForecastAssessmentService(profiles, assets)
+
+
+def get_recommendation_service(
+    profiles: ProfilesRepository = Depends(get_profiles_repo),
+    assets: AssetsRepository = Depends(get_assets_repo),
+) -> RecommendationService:
+    return RecommendationService(profiles, assets)
+
+
+def get_dashboard_service(
+    profiles: ProfilesRepository = Depends(get_profiles_repo),
+    assets: AssetsRepository = Depends(get_assets_repo),
+) -> DashboardService:
+    return DashboardService(profiles, assets)
 
 
 @dataclass
 class Principal:
-    """The authenticated caller: their user document and resolved permissions."""
+    """The authenticated caller: their user row and resolved permissions."""
 
     user: dict[str, Any]
     permissions: set[str]
@@ -42,7 +132,11 @@ class Principal:
 
 
 def _unauthorized(detail: str) -> HTTPException:
-    return HTTPException(status.HTTP_401_UNAUTHORIZED, detail=detail, headers={"WWW-Authenticate": "Bearer"})
+    return HTTPException(
+        status.HTTP_401_UNAUTHORIZED,
+        detail=detail,
+        headers={"WWW-Authenticate": "Bearer"},
+    )
 
 
 async def get_current_principal(
@@ -56,10 +150,15 @@ async def get_current_principal(
 
     The token comes from the ``Authorization: Bearer`` header (API clients,
     Swagger) or, failing that, the httpOnly cookie set at login (the browser
-    app). The user and their role are re-read from MongoDB on every request,
+    app). The user and their role are re-read from the database on every request,
     so deactivating a user or editing a role takes effect immediately.
     """
-    token = credentials.credentials if credentials else request.cookies.get(settings.cookie_name)
+    token = (
+        credentials.credentials
+        if credentials
+        else request.cookies.get(settings.cookie_name)
+    )
+
     if not token:
         raise _unauthorized("Not authenticated")
 
@@ -73,27 +172,48 @@ async def get_current_principal(
         raise _unauthorized("User not found or inactive")
 
     role = await roles.get(user["role"])
-    return Principal(user=user, permissions=effective_permissions(role))
+
+    return Principal(
+        user=user,
+        permissions=effective_permissions(role),
+    )
 
 
 def require_permissions(*required: str):
-    """Dependency factory: the caller must hold **all** of the given permissions."""
+    """Dependency factory: the caller must hold all required permissions."""
 
-    def _check(principal: Principal = Depends(get_current_principal)) -> Principal:
-        missing = [p for p in required if p not in principal.permissions]
+    def _check(
+        principal: Principal = Depends(get_current_principal),
+    ) -> Principal:
+        missing = [
+            permission
+            for permission in required
+            if permission not in principal.permissions
+        ]
+
         if missing:
-            raise HTTPException(status.HTTP_403_FORBIDDEN, detail=f"Missing permission: {', '.join(missing)}")
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                detail=f"Missing permission: {', '.join(missing)}",
+            )
+
         return principal
 
     return _check
 
 
 def require_any_permission(*allowed: str):
-    """Dependency factory: the caller must hold **at least one** of the given permissions."""
+    """Dependency factory: the caller must hold at least one allowed permission."""
 
-    def _check(principal: Principal = Depends(get_current_principal)) -> Principal:
+    def _check(
+        principal: Principal = Depends(get_current_principal),
+    ) -> Principal:
         if not principal.permissions.intersection(allowed):
-            raise HTTPException(status.HTTP_403_FORBIDDEN, detail=f"Requires one of: {', '.join(allowed)}")
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                detail=f"Requires one of: {', '.join(allowed)}",
+            )
+
         return principal
 
     return _check

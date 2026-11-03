@@ -1,0 +1,150 @@
+# StockSense Agent Guide
+
+## Purpose and current scope
+
+StockSense is a stock-intelligence project with two deliberately separate areas:
+
+- A full-stack web application built with FastAPI, Next.js, and PostgreSQL (Azure Database for PostgreSQL). The current runtime provides authentication, registration, user administration, roles, and permission-based access control.
+- An offline market-data pipeline that downloads price and macroeconomic data and builds time-series features for future forecasting work.
+
+Experimental offline forecasting and authenticated saved-model inference for content-based recommendations are implemented. Forecasting uses a trusted versioned local model-and-feature package; training, feature refresh and Yahoo downloads happen only through explicit offline commands. Production forecasting does not query numeric SQL tables. Only trusted administrator-provisioned model artifacts may be loaded. Portfolio management, brokerage integration and trade execution are not implemented; do not add them without explicit authorization. This project must not present output as personalized financial advice.
+
+Read the root `README.md` before broad changes. Read `frontend/README.md` or `data/README.md` before working in those areas.
+
+## Architecture
+
+### Backend (`backend/`)
+
+- `app/main.py` creates the FastAPI application, owns its lifespan, and registers routers.
+- `app/api/routers/` is the HTTP layer. Keep request handling and response mapping thin.
+- `app/schemas/` defines request and response validation.
+- `app/services/` owns reusable business rules and domain errors.
+- `app/repositories/` owns SQL queries (asyncpg) and persistence details.
+- `app/core/` owns configuration, permissions, and security primitives.
+- `app/db/` owns the connection pool and the table schema (idempotent `CREATE ... IF NOT EXISTS`, applied at startup).
+
+Preserve the routing-to-business-logic-to-persistence direction. Do not put SQL queries in routers or duplicate business rules across endpoints. Introduce a new abstraction only when it creates a real seam or removes repeated complexity; prefer small interfaces with substantial behavior behind them.
+
+FastAPI is the security boundary. Authorization must be enforced by backend dependencies and business rules. Frontend visibility checks are user-experience controls only.
+
+### Frontend (`frontend/`)
+
+- This is a Next.js 16 App Router application using TypeScript and Tailwind.
+- Pages and layouts live in `src/app/`; reusable UI lives in `src/components/`.
+- Backend calls are grouped by domain in `src/services/` and go through `src/lib/api.ts`.
+- Authentication state is centralized in `src/lib/auth.tsx`.
+- `src/proxy.ts` only checks whether the session cookie exists. It does not validate the token.
+- The browser uses same-origin `/api/*`; `next.config.ts` proxies those requests to FastAPI.
+
+Keep backend calls out of presentational components when a domain service is the natural seam. Reuse shared UI and types before adding variants. Preserve accessibility, responsive behavior, loading states, and actionable error messages. Do not expose authentication tokens to client-side JavaScript.
+
+### Data pipeline (`data/`)
+
+- The data pipeline is offline and is not a runtime dependency of the web application.
+- Collection, macro-data download, feature construction, and format conversion remain separate steps.
+- Parquet files retain the numeric dataset schemas; CSV files are local convenience copies.
+- Shared offline data is being migrated to Azure PostgreSQL: numeric Parquet datasets become typed SQL tables, prepared documents/chunks retain text and JSONB provenance, and original inventoried files are archived by default. See `data/SHARED_DATA.md` for the separate migration commands and connection setup. MongoDB remains the application database. Preserve original files, provenance and committed baselines until verified migration; embedding generation and retrieval remain separate work.
+- Time-series evaluation must avoid future leakage. Fit learned preprocessing on training folds only and do not replace walk-forward validation with random train/test splits.
+
+Do not download external data, overwrite committed datasets, or regenerate large artifacts unless the task explicitly requires it. Preserve dataset schemas unless a coordinated schema change is part of the request.
+
+### Deployment
+
+- Local development runs FastAPI on port 8000 and Next.js on port 3000.
+- Production uses the root `Dockerfile`: Next.js is public on port 3000 and proxies to FastAPI on loopback port 8000.
+- A push to `main` runs `.github/workflows/cicd.yaml`, pushes the `latest` image to Azure Container Registry, and causes the Azure Web App to restart through its webhook.
+
+Never commit, push, publish an image, deploy, restart Azure resources, or change repository/cloud settings unless the user explicitly requests that action.
+
+## Scope and change discipline
+
+### AI orchestration
+
+For substantial AI work, the lead agent acts as orchestrator: inspect the current
+repository, define shared contracts and dependencies, then delegate independent
+tasks to at most three concurrent subagents. Assign exclusive file ownership.
+Use read-only investigations when ownership would overlap; do not delegate tiny
+tasks or let subagents spawn additional agents without coordination.
+
+The lead owns architecture, shared interfaces, dependency changes, integration,
+diff review, and final validation. Agents report changed files, commands run,
+results, source coverage, and remaining blockers. Never overwrite another
+agent's or the user's work. Run memory-intensive local model jobs sequentially.
+
+Read `docs/ai/PLAN.md` for the active phase, ownership, and stop point. Complete
+only the authorized phase; an implementation check is not authorization to start
+an independent data-readiness gate, forecasting, RAG, or product integration.
+
+Keep source timestamps, revisions, ticker mappings, citations, and collection
+outcomes with collected data. Missing or failed collection is not neutral
+sentiment. Fit learned preprocessing only within later training folds. Keep
+local corpora, model weights, and candidate outputs under ignored storage. Shared
+data will be queried from Azure PostgreSQL after verified migration; model
+caches and quota ledgers remain local. Preserve committed baselines until then.
+
+- Implement only the requested outcome and the minimum supporting changes needed for a complete solution.
+- Preserve existing behavior unless the request explicitly changes it.
+- Do not mix unrelated cleanup, broad refactors, renames, formatting sweeps, or dependency upgrades into a focused change.
+- Preserve user-authored and untracked changes. Do not discard or overwrite work you did not create.
+- Before changing an interface, trace its callers and preserve the contract or update all affected callers and tests together.
+- Ask before making a material scope expansion, adding a production dependency, changing a database or dataset schema, breaking an API contract, or altering authentication, authorization, CI, or deployment behavior beyond the request.
+- Do not commit generated files, local virtual environments, build output, caches, secrets, or `.env` files.
+
+## Engineering practices
+
+- Prefer clear, typed, cohesive modules and descriptive names over cleverness.
+- Keep interfaces small, hide implementation details, and place behavior at the seam where callers and tests naturally exercise it.
+- Reuse existing patterns before introducing frameworks, layers, or utilities.
+- Keep functions focused, but do not split code into shallow pass-through wrappers.
+- Validate input at system edges and handle errors at the layer that can add useful context.
+- Make authorization fail closed. Preserve password hashing, HTTP-only cookie handling, role checks, and production secret validation.
+- Never log credentials, tokens, connection strings, personal data, or secret values.
+- Use configuration and environment variables rather than hard-coded deployment values.
+- Add comments for non-obvious reasons and invariants, not for code that already explains itself.
+- Add or update tests at the public interface affected by the change. Regression tests should reproduce the real failure mode.
+- Keep documentation synchronized when setup, commands, architecture, configuration, or user-visible behavior changes.
+
+## Validation
+
+Run the narrowest relevant checks first, then the broader checks justified by the change.
+
+### Backend
+
+From `backend/` with its virtual environment active:
+
+```bash
+pytest -q
+```
+
+The integration suite drops the database named `stocksense_test` before and after tests. Never point the `TEST_POSTGRES_*` variables at a server where that database contains valuable data. Do not run the suite until the target is known to be a safe test instance.
+
+### Frontend
+
+From `frontend/`:
+
+```bash
+npm run lint
+npx tsc --noEmit
+npm run build
+```
+
+This repository uses Next.js 16. Consult the installed documentation under `frontend/node_modules/next/dist/docs/` before relying on conventions from older versions.
+
+### Data and deployment
+
+- For data changes, validate the smallest affected pipeline stage and inspect its schema and representative output. Do not run network-backed downloads merely as a generic check.
+- For container or startup changes, build the Docker image when the environment permits it.
+- Do not use deployment as validation.
+
+If a relevant check cannot be run, state exactly what was not run and why.
+
+## Completion standard
+
+Before handing work back:
+
+- Review the diff for unintended scope changes, secrets, generated files, and debugging artifacts.
+- Confirm the requested behavior and relevant failure paths.
+- Report changed files and validation results concisely.
+- Identify remaining risks, assumptions, or unverified behavior without claiming completion beyond the evidence.
+
+Keep this file focused on stable repository-wide guidance. Update it when architecture, commands, or recurring review expectations materially change.
